@@ -39,6 +39,14 @@ pending item afterwards neither swaps the stem/options returned by repeated
 answer and IRT parameters all come from the frozen version), a fresh
 session is served the new version, and a re-selection after the pending
 item is withdrawn binds the replacement's current version.
+
+The frozen-IRT-parameters section shows that every answer freezes the
+served revision's difficulty/discrimination onto its response record and
+that the standard error is recomputed at the current theta from those
+frozen values: a formal import that recalibrates already-answered items
+leaves the SE of a session without new answers bit-identical and cannot
+spuriously trigger precision_reached, while a fresh answer after a
+recalibration freezes the new served parameters.
 """
 
 from __future__ import annotations
@@ -207,6 +215,7 @@ def main() -> None:
     demo_withdrawal()
     demo_frozen_tags()
     demo_served_version()
+    demo_frozen_irt_params()
     demo_revisions()
 
 
@@ -1017,6 +1026,134 @@ def demo_served_version() -> None:
 
     # 收尾：撤回演示题，保证重复运行本脚本时其他演示段落不受影响。
     for iid in ("DEMO-SV-1", "DEMO-SV-2"):
+        call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+    print("  -> 演示题已撤回，不影响后续演示 ✔")
+
+
+def demo_frozen_irt_params() -> None:
+    """Show the SE is computed from per-answer frozen IRT parameters.
+
+    A formal import that recalibrates already-answered items must not shift
+    the standard error of a session that saw no new answers (no drift), and
+    must neither trigger nor miss ``precision_reached`` retroactively; a
+    fresh answer after the recalibration freezes the new served parameters.
+    """
+    print("\n--- 作答参数冻结：导入改参不影响已答题的标准误与精度停测 ---")
+
+    # 三道专用演示题：a=2.0，b 沿全对轨迹 0/1/2 排列（a=2 时全对 θ 每题 +1），
+    # 会话必然依次取 DEMO-SE-1/2/3；演示题库 a<=1.8（信息量 <=0.81）不会干扰。
+    def se_item(iid: str, difficulty: float, discrimination: float = 2.0) -> dict:
+        return {
+            "id": iid, "difficulty": difficulty, "discrimination": discrimination,
+            "content_tag": "精度演示", "stem": f"精度演示题 {iid}：1 + 1 = ?",
+            "options": [{"key": "A", "text": "2"}, {"key": "B", "text": "3"}],
+            "answer": "A",
+        }
+
+    imported = call(
+        "POST", "/api/items/import",
+        {"items": [se_item("DEMO-SE-1", 0.0), se_item("DEMO-SE-2", 1.0),
+                   se_item("DEMO-SE-3", 2.0)]},
+    )
+    assert imported["valid"] is True
+    # 重复运行时上一轮可能改过参数或把演示题留在撤回状态：上面的导入已重置
+    # 参数，这里统一启用；同时撤回冻结标签演示遗留的 FZC 组（同为 a=2.0，
+    # 会与本组并列干扰选题）。
+    for iid in ("DEMO-SE-1", "DEMO-SE-2", "DEMO-SE-3"):
+        assert call("PATCH", f"/api/items/{iid}/availability",
+                    {"is_active": True})["is_active"] is True
+    for iid in ("DEMO-FZC-1", "DEMO-FZC-2", "DEMO-FZC-3", "DEMO-FZC-4"):
+        call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+
+    # target_se=0.8、min_precision_items=2：按冻结参数计算，本组作答轨迹下
+    # SE 始终 > 0.8，精度停测不应触发；若按题库现值重算（旧行为），下面的
+    # 改参会先把 SE 压低、再在第 3 题作答后把 SE 算成 ≈0.45 而误触发停测。
+    s1 = call("POST", "/api/sessions",
+              {"max_items": 5, "exposure_limit": 10_000,
+               "target_se": 0.8, "min_precision_items": 2})
+    s1id = s1["id"]
+
+    def answer_a(turn: int) -> dict:
+        chosen = call("POST", f"/api/sessions/{s1id}/next")
+        item = chosen["item"]
+        assert item is not None
+        result = call(
+            "POST", f"/api/sessions/{s1id}/responses",
+            {"response_id": f"demo-se-{s1id[:8]}-{turn}",
+             "item_id": item["id"], "response": "A"},
+        )
+        assert result["correct"] is True
+        return {"item": item, "result": result}
+
+    a1 = answer_a(1)
+    assert a1["item"]["id"] == "DEMO-SE-1"
+    # 作答记录冻结送达版本参数（a=2.0, b=0.0），随响应一并返回。
+    assert a1["result"]["difficulty"] == 0.0
+    assert a1["result"]["discrimination"] == 2.0
+    a2 = answer_a(2)
+    assert a2["item"]["id"] == "DEMO-SE-2"
+    se_before = call("GET", f"/api/sessions/{s1id}/progress")["standard_error"]
+    assert se_before is not None and se_before > 0.8
+    print(f"  -> 已答 2 题（θ=2.0），SE={round(se_before, 4)} > 0.8，会话继续")
+
+    # 正式导入把两道已答题改参（a 2.0->3.0、b 移到 3.0）：题库现值已变，
+    # 但无新增作答的本场 SE 必须逐位不变（旧行为会按新参数重算成 ≈1.11）。
+    call("POST", "/api/items/import",
+         {"items": [se_item("DEMO-SE-1", 3.0, discrimination=3.0),
+                    se_item("DEMO-SE-2", 3.0, discrimination=3.0)]})
+    progress = call("GET", f"/api/sessions/{s1id}/progress")
+    assert progress["standard_error"] == se_before, \
+        "导入改参不得改变无新增作答会话的标准误"
+    history = call("GET", f"/api/sessions/{s1id}/responses")
+    assert history["results"][0]["difficulty"] == 0.0
+    assert history["results"][0]["discrimination"] == 2.0
+    show("两道已答题被导入改参（a 2.0→3.0、b→3.0）：SE 不漂移", {
+        "题库当前参数": {
+            "difficulty": call("GET", "/api/items/DEMO-SE-1")["difficulty"],
+            "discrimination":
+                call("GET", "/api/items/DEMO-SE-1")["discrimination"],
+        },
+        "首条作答冻结参数": {
+            "difficulty": history["results"][0]["difficulty"],
+            "discrimination": history["results"][0]["discrimination"],
+        },
+        "standard_error": progress["standard_error"],
+    })
+    print("  -> 题库参数已改，但作答记录保留冻结参数，SE 逐位不变 ✔")
+
+    # 第 3 题作答后：冻结参数下 SE≈1.41 仍高于 0.8，不得停测（旧行为会把
+    # 已答题按改后参数算进 SE，SE≈0.45 <= 0.8 而误触发 precision_reached）。
+    a3 = answer_a(3)
+    assert a3["item"]["id"] == "DEMO-SE-3"
+    progress = call("GET", f"/api/sessions/{s1id}/progress")
+    assert progress["status"] == "active", \
+        "冻结参数下 SE 仍高于 target_se，不得误触发 precision_reached"
+    assert progress["standard_error"] is not None
+    assert progress["standard_error"] > 0.8
+    print(f"  -> 第 3 题后 SE={round(progress['standard_error'], 4)} 仍按冻结"
+          "参数计算且 > 0.8，未误触发 precision_reached，会话继续 ✔")
+
+    # 新作答冻结新参数：再次改参后，新会话作答同一题冻结的是新版本参数。
+    call("POST", "/api/items/import",
+         {"items": [se_item("DEMO-SE-1", 0.0, discrimination=5.0)]})
+    s2 = call("POST", "/api/sessions",
+              {"max_items": 1, "exposure_limit": 10_000})
+    s2id = s2["id"]
+    chosen = call("POST", f"/api/sessions/{s2id}/next")
+    assert chosen["item"]["id"] == "DEMO-SE-1"  # a=5.0 在 θ=0 信息量 6.25，必然中选
+    r = call("POST", f"/api/sessions/{s2id}/responses",
+             {"response_id": f"demo-se-{s2id[:8]}-1",
+              "item_id": "DEMO-SE-1", "response": "A"})
+    assert r["difficulty"] == 0.0 and r["discrimination"] == 5.0
+    print("  -> 再次改参后新会话作答同一题：记录冻结的是新版本参数（a=5.0）✔")
+
+    # 第一个会话的 SE 仍不受后续改参与新会话作答影响。
+    progress1 = call("GET", f"/api/sessions/{s1id}/progress")
+    assert progress1["standard_error"] == progress["standard_error"]
+    print("  -> 第一个会话的 SE 依旧不变，改参与新作答均不追溯影响已答题 ✔")
+
+    # 收尾：撤回演示题，保证重复运行本脚本时其他演示段落不受影响。
+    for iid in ("DEMO-SE-1", "DEMO-SE-2", "DEMO-SE-3"):
         call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
     print("  -> 演示题已撤回，不影响后续演示 ✔")
 

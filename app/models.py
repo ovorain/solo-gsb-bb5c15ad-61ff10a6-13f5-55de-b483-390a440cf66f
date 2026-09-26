@@ -456,7 +456,11 @@ class SessionOut(BaseModel):
         None, description="精度停测最少作答题数；未启用时为 null"
     )
     standard_error: float | None = Field(
-        None, description="当前 θ 下全部已答题的估计标准误 1/√Σ信息；无已答题为 null"
+        None,
+        description=(
+            "当前 θ 下全部已答题的估计标准误 1/√Σ信息，信息量按各条作答"
+            "提交时冻结的难度/区分度重算；无已答题为 null"
+        ),
     )
     status: str
     finish_reason: str | None
@@ -511,6 +515,19 @@ class ResponseOut(BaseModel):
             "该题作答时冻结的内容标签（取自当时题库 content_tag，无标签为 null）；"
             "之后导入改标签或撤回题目都不会改变它，配额统计始终按此冻结值"
         ),
+    )
+    difficulty: float | None = Field(
+        None,
+        description=(
+            "作答时随本记录冻结的送达版本难度 b（取自取题时冻结的修订版本快照，"
+            "与该次 Newton 更新所用参数一致）；会话状态、进度、取题与精度停测的"
+            "标准误一律按各条作答冻结的难度/区分度在当前 θ 下重算 Fisher 信息，"
+            "之后正式导入改参不追溯影响已答题；旧库首启按当时题库参数一次性回填"
+        ),
+    )
+    discrimination: float | None = Field(
+        None,
+        description="作答时随本记录冻结的送达版本区分度 a（语义同 difficulty）",
     )
     theta_before: float
     theta_after: float
@@ -594,7 +611,11 @@ class ProgressOut(BaseModel):
         None, description="精度停测最少作答题数；未启用时为 null"
     )
     standard_error: float | None = Field(
-        None, description="当前 θ 下的能力估计标准误；无已答题或总信息为零时为 null"
+        None,
+        description=(
+            "当前 θ 下的能力估计标准误，按各条作答提交时冻结的难度/区分度"
+            "重算总信息；无已答题或总信息为零时为 null"
+        ),
     )
     finish_reason: str | None
     current_item: ItemOut | None

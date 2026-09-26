@@ -59,6 +59,17 @@ current version, and a stored ``response_id`` replay still returns the first
 result.  The answer-time ``content_tag`` freeze is unchanged: it keeps
 reading the bank tag as it is when the answer is submitted.
 
+The served revision's 2PL parameters are frozen onto each response row at
+answer time (``responses.difficulty`` / ``responses.discrimination``).  The
+session standard error shown by the session, progress and /next payloads and
+used by the precision stop rule is always recomputed at the current theta
+from those per-answer frozen parameters, never from the bank's live values:
+a formal import that recalibrates an already-answered item can no longer
+shift the SE of a session that saw no new answers, so it can neither
+trigger nor miss ``precision_reached`` retroactively.  Legacy databases
+backfill the two columns once at first startup from the bank's parameters
+at that moment and never recompute them afterwards.
+
 ``POST /api/sessions/{id}/review-plan`` turns a finished session's wrong
 answers (the ``score = 0`` frozen at answer time) into a spaced-repetition
 review plan: stem, options and the correct answer are frozen into the plan at
@@ -156,6 +167,11 @@ app = FastAPI(
         "欠额限制、精度停测配额门槛均按冻结标签统计，之后导入改标签或"
         "撤回已答题不追溯改写已答归属、不误判配额已满足或提前结束"
         "（旧库首启按当时题库标签一次性回填）；"
+        "作答提交时同时把送达版本的难度/区分度随答题记录冻结："
+        "会话状态、进度、取题与精度停测的标准误一律在当前 θ 下按各条作答的"
+        "冻结参数重算 Fisher 信息，正式导入事后修改已答题参数不会改变"
+        "无新增作答会话的标准误，不会误触发或错过 precision_reached"
+        "（旧库首启按当时题库参数一次性回填，之后不再回填）；"
         "已结束会话的错题（作答时冻结 score=0）可创建间隔复习计划（SM-2）："
         "创建时冻结题干/选项/正确答案，同一会话重复创建返回原计划；"
         "支持按 UTC 日期查询到期题与提交 0~5 分复习结果"
@@ -163,7 +179,7 @@ app = FastAPI(
         "题目或评分不同返回 409 且不改动结果与日程，冲突检查先于到期判断；"
         "仅接受已到期题，同一写事务记录结果并推进日程）。"
     ),
-    version="1.11.0",
+    version="1.12.0",
 )
 
 
@@ -415,21 +431,32 @@ def session_standard_error(
     """SE of the ability estimate: ``1 / sqrt(sum I_j(theta))``.
 
     Fisher information of *every* item already answered in this session is
-    re-evaluated at the current theta (2PL).  Returns ``None`` when no item
-    has been answered or the summed information is not positive; the
-    precision stop rule can never fire in that case.
+    re-evaluated at the current theta (2PL) from the difficulty and
+    discrimination **frozen on each response row at answer time** -- never
+    from the item bank's current parameters.  A later formal import that
+    recalibrates an already-answered item therefore cannot shift the SE of
+    a session that saw no new answers, and can neither trigger nor miss a
+    ``precision_reached`` retroactively.  (Rows whose frozen parameters
+    are NULL -- only possible when the bank item disappeared outside the
+    API, which never deletes items -- contribute no information.)  Returns
+    ``None`` when no item has been answered or the summed information is
+    not positive; the precision stop rule can never fire in that case.
     """
     rows = conn.execute(
         """
-        SELECT i.discrimination AS a, i.difficulty AS b
-        FROM responses r JOIN items i ON i.id = r.item_id
-        WHERE r.session_id = ?
+        SELECT discrimination AS a, difficulty AS b
+        FROM responses
+        WHERE session_id = ?
         """,
         (session_id,),
     ).fetchall()
     if not rows:
         return None
-    total_info = math.fsum(irt.information(theta, r["a"], r["b"]) for r in rows)
+    total_info = math.fsum(
+        irt.information(theta, r["a"], r["b"])
+        for r in rows
+        if r["a"] is not None and r["b"] is not None
+    )
     return irt.standard_error(total_info)
 
 
@@ -617,6 +644,8 @@ def serialize_response(row: sqlite3.Row) -> ResponseOut:
         score=row["score"],
         correct_answer=row["correct_answer"],
         content_tag=row["content_tag"],
+        difficulty=row["difficulty"],
+        discrimination=row["discrimination"],
         theta_before=row["theta_before"],
         theta_after=row["theta_after"],
         theta_change=row["theta_after"] - row["theta_before"],
@@ -1939,20 +1968,27 @@ def submit_response(
     version's 2PL parameters — so a formal import changing the item after
     it was served can never re-judge the answer by content the examinee
     never saw, and the stored result stays consistent with the ability
-    update.  (Sessions predating the frozen-version column fall back to the
-    live bank content.)  The frozen ``content_tag`` is still the bank tag
-    as it is at answer time, exactly as before.
+    update.  The served version's ``difficulty``/``discrimination`` are
+    also frozen onto the response row itself: every later standard-error
+    computation (progress, /next and the precision stop below) sums Fisher
+    information from those frozen values, so a later bank recalibration
+    cannot shift the SE of a session that saw no new answers.  (Sessions
+    predating the frozen-version column fall back to the live bank
+    content.)  The frozen ``content_tag`` is still the bank tag as it is
+    at answer time, exactly as before.
 
     After the theta update the optional precision stop is evaluated in the
     same transaction: when the session has a ``target_se``, the summed 2PL
     Fisher information of every answered item is recomputed at the new theta
-    and the session finishes with ``finish_reason = 'precision_reached'``
+    **from the parameters frozen on each response row** and the session
+    finishes with ``finish_reason = 'precision_reached'``
     once the answered count reaches ``min_precision_items``, the standard
     error is at most ``target_se`` and all tag quotas are met.  The quota
     check counts the tags frozen on each response at answer time, so a later
     bank retag cannot make a missing quota look met and trigger the stop
-    early.  A replayed request takes the idempotency branch above and never
-    re-evaluates it.
+    early; likewise a later bank recalibration cannot move the SE across
+    ``target_se`` and trigger (or undo) the stop retroactively.  A replayed
+    request takes the idempotency branch above and never re-evaluates it.
     """
     response_key = body.response.strip().upper()
     stored_row: sqlite3.Row | None = None
@@ -2054,6 +2090,14 @@ def submit_response(
             # (unchanged behaviour), independent of the served-version
             # snapshot used for scoring above.
             frozen_tag = item["content_tag"] or None
+            # Freeze the SERVED revision's IRT parameters onto the response
+            # row (same snapshot the Newton update above just used).  The
+            # session standard error -- progress, /next and the precision
+            # stop below -- is always recomputed from these frozen values,
+            # so a later formal import that recalibrates this item cannot
+            # shift the SE of any session that already answered it.
+            frozen_difficulty = served["difficulty"]
+            frozen_discrimination = served["discrimination"]
 
             try:
                 conn.execute(
@@ -2062,8 +2106,8 @@ def submit_response(
                         id, session_id, item_id, response, score, correct_answer,
                         theta_before, theta_after, p_correct,
                         information_at_theta, exposure_count_at_select,
-                        content_tag, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        content_tag, difficulty, discrimination, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         body.response_id,
@@ -2078,6 +2122,8 @@ def submit_response(
                         info,
                         exposure_at_select,
                         frozen_tag,
+                        frozen_difficulty,
+                        frozen_discrimination,
                         now,
                     ),
                 )
@@ -2123,11 +2169,14 @@ def submit_response(
                 elif session["target_se"] is not None:
                     # Optional precision stop: re-evaluate the summed 2PL
                     # Fisher information of *all* answered items at the new
-                    # theta.  The session ends in this same transaction only
-                    # when the answer count has reached the configured floor,
-                    # SE <= target_se and every tag quota is already met.  A
-                    # zero/non-positive total gives SE = NULL and can never
-                    # fire; otherwise the selection flow continues unchanged.
+                    # theta, using the a/b frozen on each response row (so a
+                    # bank recalibration of an answered item can neither add
+                    # nor remove information here).  The session ends in
+                    # this same transaction only when the answer count has
+                    # reached the configured floor, SE <= target_se and
+                    # every tag quota is already met.  A zero/non-positive
+                    # total gives SE = NULL and can never fire; otherwise
+                    # the selection flow continues unchanged.
                     se = session_standard_error(conn, session_id, theta_after)
                     quota_met = not tag_shortfalls(
                         tag_minimums_for(conn, session_id),
