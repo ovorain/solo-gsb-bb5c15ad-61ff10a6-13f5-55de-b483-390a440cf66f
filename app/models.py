@@ -399,7 +399,8 @@ class SessionCreate(BaseModel):
         gt=0.0,
         allow_inf_nan=False,
         description=(
-            "可选能力估计精度停测目标标准误（正有限值，SE = 1/√Σ Fisher 信息）；"
+            "可选能力估计精度停测目标标准误（正有限值，SE = 1/√Σ Fisher 信息，"
+            "各题信息按作答时冻结的送达版本参数在当前 θ 下重算）；"
             "须与 min_precision_items 同时提供，不传则不按精度停测"
         ),
     )
@@ -456,7 +457,11 @@ class SessionOut(BaseModel):
         None, description="精度停测最少作答题数；未启用时为 null"
     )
     standard_error: float | None = Field(
-        None, description="当前 θ 下全部已答题的估计标准误 1/√Σ信息；无已答题为 null"
+        None,
+        description=(
+            "当前 θ 下按各条作答冻结的难度/区分度重算 Fisher 信息得到的"
+            "估计标准误 1/√Σ信息；无已答题为 null；题库改参不追溯影响"
+        ),
     )
     status: str
     finish_reason: str | None
@@ -510,6 +515,22 @@ class ResponseOut(BaseModel):
         description=(
             "该题作答时冻结的内容标签（取自当时题库 content_tag，无标签为 null）；"
             "之后导入改标签或撤回题目都不会改变它，配额统计始终按此冻结值"
+        ),
+    )
+    difficulty: float | None = Field(
+        None,
+        description=(
+            "该题作答时冻结的送达版本难度 b；会话标准误按各条作答的冻结参数"
+            "在当前 θ 下重算，之后导入改参数不追溯影响（仅极早期遗留数据"
+            "在源题缺失时可能为 null）"
+        ),
+    )
+    discrimination: float | None = Field(
+        None,
+        description=(
+            "该题作答时冻结的送达版本区分度 a；会话标准误按各条作答的冻结参数"
+            "在当前 θ 下重算，之后导入改参数不追溯影响（仅极早期遗留数据"
+            "在源题缺失时可能为 null）"
         ),
     )
     theta_before: float
@@ -594,7 +615,11 @@ class ProgressOut(BaseModel):
         None, description="精度停测最少作答题数；未启用时为 null"
     )
     standard_error: float | None = Field(
-        None, description="当前 θ 下的能力估计标准误；无已答题或总信息为零时为 null"
+        None,
+        description=(
+            "当前 θ 下按各条作答冻结参数重算的能力估计标准误；"
+            "无已答题或总信息为零时为 null；题库改参不追溯影响"
+        ),
     )
     finish_reason: str | None
     current_item: ItemOut | None

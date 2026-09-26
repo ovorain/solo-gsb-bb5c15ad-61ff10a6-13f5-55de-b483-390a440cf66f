@@ -96,6 +96,17 @@ CREATE TABLE IF NOT EXISTS responses (
     -- was answered.  Legacy rows are backfilled exactly once at first
     -- upgrade (see _migrate_response_content_tags) and never recomputed.
     content_tag               TEXT,
+    -- 2PL parameters of the SERVED revision, frozen at answer time.  The
+    -- session standard error (progress, /next and the precision stop rule)
+    -- re-evaluates every answer's Fisher information at the current theta
+    -- from THESE copies, never from the item bank's current values, so a
+    -- formal import recalibrating an already-answered item cannot drift
+    -- the SE of a session that received no new answers (and can neither
+    -- trigger nor miss precision_reached retroactively).  Legacy rows are
+    -- backfilled exactly once at first upgrade from the bank parameters of
+    -- that moment (see _migrate_response_irt_params) and never recomputed.
+    difficulty                REAL,
+    discrimination            REAL,
     created_at                TEXT NOT NULL,
     UNIQUE (session_id, item_id) -- an item can only be answered once per session
 );
@@ -254,6 +265,47 @@ def _migrate_response_content_tags(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_response_irt_params(conn: sqlite3.Connection) -> None:
+    """Give legacy ``responses`` rows their frozen 2PL parameters once.
+
+    The frozen-parameter columns are absent on databases created before this
+    feature: the first startup adds them and backfills every historical
+    answer from the item bank's *current* ``difficulty``/``discrimination``
+    (the best approximation of what the examinee was scored with).  This
+    snapshot is taken exactly once: the backfill is coupled to the
+    presence-of-column migration, so on every later startup the columns
+    already exist and nothing is touched -- subsequent imports that
+    recalibrate an item can never rewrite an already-frozen answer.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='responses'"
+    ).fetchone()
+    if exists is None:
+        return
+    added_difficulty = _ensure_column(conn, "responses", "difficulty", "REAL")
+    added_discrimination = _ensure_column(
+        conn, "responses", "discrimination", "REAL"
+    )
+    if not (added_difficulty or added_discrimination):
+        return
+    conn.execute(
+        """
+        UPDATE responses
+           SET difficulty = (
+                   SELECT i.difficulty
+                     FROM items i
+                    WHERE i.id = responses.item_id
+               ),
+               discrimination = (
+                   SELECT i.discrimination
+                     FROM items i
+                    WHERE i.id = responses.item_id
+               )
+         WHERE difficulty IS NULL OR discrimination IS NULL
+        """
+    )
+
+
 # Columns copied verbatim when rebuilding the sessions table for the pause
 # migration; kept in sync with the canonical CREATE TABLE above.
 _SESSION_COLUMNS = (
@@ -361,6 +413,12 @@ def init_db() -> None:
         # exactly once; a brand-new table already carries the column, so the
         # migration is a no-op for it.
         _migrate_response_content_tags(conn)
+        # Frozen answer IRT parameters: same one-shot pattern -- a legacy
+        # responses table acquires the difficulty/discrimination columns and
+        # its rows are backfilled from the bank's current parameters exactly
+        # once; later startups (and later bank recalibrations) never
+        # rewrite the frozen values.
+        _migrate_response_irt_params(conn)
         count = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
         if count == 0:
             conn.executemany(

@@ -2,8 +2,8 @@ FROM python:3.11-slim
 
 # Image metadata; bump together with app.version in app/main.py.
 LABEL org.opencontainers.image.title="adaptive-quiz-api" \
-      org.opencontainers.image.version="1.11.0" \
-      org.opencontainers.image.description="2PL IRT 计算机自适应测验 API（含题库批量导入/预检、题库修订历史、取题版本冻结按送达版本判分、单题质量复盘、题目撤回/启用、答卷雷同复核、单题预测概率校准、错题间隔复习 SM-2）"
+      org.opencontainers.image.version="1.12.0" \
+      org.opencontainers.image.description="2PL IRT 计算机自适应测验 API（含题库批量导入/预检、题库修订历史、取题版本冻结按送达版本判分、作答参数冻结防精度漂移、单题质量复盘、题目撤回/启用、答卷雷同复核、单题预测概率校准、错题间隔复习 SM-2）"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

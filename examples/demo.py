@@ -39,6 +39,14 @@ pending item afterwards neither swaps the stem/options returned by repeated
 answer and IRT parameters all come from the frozen version), a fresh
 session is served the new version, and a re-selection after the pending
 item is withdrawn binds the replacement's current version.
+
+The frozen-parameter section shows that each answer persists the served
+revision's difficulty/discrimination on the response row: the session
+standard error (progress, /next, precision stop) is recomputed from those
+per-answer frozen parameters, so a formal import recalibrating an
+already-answered item cannot drift the SE of a session that received no
+new answers, and can neither trigger nor miss ``precision_reached``
+retroactively.
 """
 
 from __future__ import annotations
@@ -207,6 +215,7 @@ def main() -> None:
     demo_withdrawal()
     demo_frozen_tags()
     demo_served_version()
+    demo_frozen_irt_params()
     demo_revisions()
 
 
@@ -1019,6 +1028,131 @@ def demo_served_version() -> None:
     for iid in ("DEMO-SV-1", "DEMO-SV-2"):
         call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
     print("  -> 演示题已撤回，不影响后续演示 ✔")
+
+
+def demo_frozen_irt_params() -> None:
+    """Show answered items' frozen IRT params keep the session SE drift-free.
+
+    A formal import that recalibrates *already-answered* items afterwards
+    must not change the standard error of a session that received no new
+    answers: progress, /next and the precision stop all recompute Fisher
+    information from the difficulty/discrimination frozen on each response
+    at answer time, never from the bank's current values.
+    """
+    print("\n--- 作答参数冻结：导入改参后标准误不漂移、精度停测不被误触发 ---")
+
+    # 四道专用演示题：a=5.0，b 沿全对轨迹 0/0.4/0.8/1.2 排列（答对一题
+    # theta 恰好前进 0.4），信息量（6.25）远高于演示题库（a<=1.8），
+    # 选题结果确定；重复运行只更新内容，曝光数与启用状态由导入保留。
+    def fp_item(iid: str, difficulty: float,
+                discrimination: float = 5.0) -> dict:
+        return {
+            "id": iid, "difficulty": difficulty,
+            "discrimination": discrimination,
+            "content_tag": "参数冻结演示", "stem": f"参数冻结演示题 {iid}：1 + 1 = ?",
+            "options": [{"key": "A", "text": "2"}, {"key": "B", "text": "3"}],
+            "answer": "A",
+        }
+
+    fp_specs = [("DEMO-FP-1", 0.0), ("DEMO-FP-2", 0.4),
+                ("DEMO-FP-3", 0.8), ("DEMO-FP-4", 1.2)]
+    imported = call(
+        "POST", "/api/items/import",
+        {"items": [fp_item(iid, b) for iid, b in fp_specs]},
+    )
+    assert imported["valid"] is True
+    for iid, _ in fp_specs:
+        assert call("PATCH", f"/api/items/{iid}/availability",
+                    {"is_active": True})["is_active"] is True
+
+    # 精度停测会话：target_se 足够小，本轨迹下几题内不会触发。
+    session = call(
+        "POST", "/api/sessions",
+        {"max_items": 8, "exposure_limit": 10_000,
+         "target_se": 0.3, "min_precision_items": 2},
+    )
+    sid = session["id"]
+
+    # 全答对 3 题：作答即把送达版本参数（a=5.0，b 见上）冻结进答题记录。
+    answered: list[str] = []
+    frozen_b: dict[str, float] = {}
+    for turn, (iid, b) in enumerate(fp_specs[:3], start=1):
+        chosen = call("POST", f"/api/sessions/{sid}/next")
+        assert chosen["item"]["id"] == iid
+        result = call(
+            "POST", f"/api/sessions/{sid}/responses",
+            {"response_id": f"demo-fp-{sid[:8]}-{turn}",
+             "item_id": iid, "response": "A"},
+        )
+        assert result["correct"] is True
+        assert result["discrimination"] == 5.0 and result["difficulty"] == b
+        answered.append(iid)
+        frozen_b[iid] = b
+    progress = call("GET", f"/api/sessions/{sid}/progress")
+    se_before = progress["standard_error"]
+    assert progress["status"] == "active"
+    print(f"  -> 作答 3 题（全对）：theta={progress['theta']:.4f}，"
+          f"SE={se_before:.4f}，答题记录已冻结送达版本参数 ✔")
+
+    # 正式导入把 3 道已答题改参（a: 5.0 -> 0.01，b 改为 5.0）：题库现值
+    # 已变，但本会话没有新增作答，SE 不允许漂移。
+    call(
+        "POST", "/api/items/import",
+        {"items": [fp_item(iid, 5.0, discrimination=0.01) for iid in answered]},
+    )
+    bank_now = call("GET", f"/api/items/{answered[0]}")
+    assert bank_now["difficulty"] == 5.0 and bank_now["discrimination"] == 0.01
+
+    after = call("GET", f"/api/sessions/{sid}/progress")
+    assert after["standard_error"] == se_before
+    assert after["status"] == "active", "改参不得误触发精度停测"
+    assert call("GET", f"/api/sessions/{sid}")["standard_error"] == se_before
+    nxt = call("POST", f"/api/sessions/{sid}/next")
+    assert nxt["standard_error"] == se_before
+    # 旧逻辑（按题库现值重算）会把 SE 漂移到约 115：
+    theta_now = after["theta"]
+    drifted = 1 / math.sqrt(3 * 0.01 * 0.01 * 0.25)
+    show("正式导入修改已答题参数后：SE 不漂移", {
+        "题库当前参数（已答题）": {"difficulty": 5.0, "discrimination": 0.01},
+        "改参前 SE": se_before,
+        "改参后 SE（progress/会话/next 三处一致）": after["standard_error"],
+        "若按题库现值重算（旧逻辑）": round(drifted, 4),
+        "status": after["status"],
+    })
+    print("  -> 题库参数已改，SE 三处查询均不变，会话未被误触发停测 ✔")
+
+    # 答题记录里的冻结参数不受改参影响。
+    history = call("GET", f"/api/sessions/{sid}/responses")
+    for row in history["results"]:
+        assert row["difficulty"] == frozen_b[row["item_id"]]
+        assert row["discrimination"] == 5.0
+    print("  -> 答题记录中的冻结难度/区分度不受改参影响 ✔")
+
+    # 继续作答：SE 仍按各条作答的冻结参数在当前 theta 下重算（与手算一致）。
+    chosen = call("POST", f"/api/sessions/{sid}/next")
+    assert chosen["item"]["id"] == "DEMO-FP-4"
+    result = call(
+        "POST", f"/api/sessions/{sid}/responses",
+        {"response_id": f"demo-fp-{sid[:8]}-4",
+         "item_id": "DEMO-FP-4", "response": "A"},
+    )
+    assert result["difficulty"] == 1.2 and result["discrimination"] == 5.0
+    progress = call("GET", f"/api/sessions/{sid}/progress")
+    theta_now = progress["theta"]
+    total_info = 0.0
+    for b in (0.0, 0.4, 0.8, 1.2):
+        p = 1 / (1 + math.exp(-5.0 * (theta_now - b)))
+        total_info += 25.0 * p * (1 - p)
+    expected_se = 1 / math.sqrt(total_info)
+    assert abs(progress["standard_error"] - expected_se) < 1e-12
+    print(f"  -> 第 4 题作答后 SE={progress['standard_error']:.4f}，"
+          "与按冻结参数手算一致 ✔")
+
+    # 收尾：撤回演示题，保证重复运行本脚本时其他演示段落不受影响。
+    for iid, _ in fp_specs:
+        call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+    print("  -> 演示题已撤回，不影响后续演示 ✔")
+
 
 
 def demo_revisions() -> None:
